@@ -1,0 +1,13 @@
+{
+  "domain": "rh_oft",
+  "name": "OFT Timer",
+  "author": "Open FPV Timer",
+  "author_uri": "https://github.com/open-fpv-timer",
+  "description": "Adds an Open FPV Timer (OFT) gate as timing seats in RotorHazard, over the LAN.",
+  "documentation_uri": "https://github.com/open-fpv-timer/rh-oft",
+  "license": "GPL-3.0-or-later",
+  "license_uri": "https://github.com/open-fpv-timer/rh-oft/blob/main/LICENSE",
+  "version": "0.1.0",
+  "required_rhapi_version": "1.4",
+  "zip_filename": "rh_oft.zip"
+}
