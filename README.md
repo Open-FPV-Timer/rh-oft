@@ -38,3 +38,10 @@ linearly: `rh = (ddb + 1200) / 8`, clamped to 1–255 (noise floor −92 dB → 
 −60 dB → 75). The inverse is used for EnterAt / ExitAt.
 
 GPL-3.0-or-later.
+
+## Acknowledgements
+
+OFT is inspired by [FPVGate](https://github.com/LouisHitchcock/FPVGateC5MK), which showed
+that an ESP32-C5 can time laps, and builds on [widscan58](https://github.com/CapnBry/widscan58),
+esp-sdr, C5VRX and RotorHazard. The full list is in the
+[oft README](https://github.com/Open-FPV-Timer/oft#acknowledgements).
