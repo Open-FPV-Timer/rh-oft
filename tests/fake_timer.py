@@ -19,7 +19,6 @@ class FakeTimer:
         self.crossings = []  # dicts with seq, seat, t_mid...
         self.config = {
             "seats": [{"seat": 0, "freq_mhz": 5800, "enabled": True}],
-            "seats_per_node": 8,
             "threshold": {"mode": "auto", "snr_enter": 150, "hysteresis": 50},
             "min_lap_ms": 2000,
         }
