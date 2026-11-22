@@ -2,7 +2,7 @@ import unittest
 from time import monotonic
 
 from fake_timer import FakeTimer
-from rh_oft.interface import OftInterface, ddb_to_rh, rh_to_ddb, STATUS_S, TIME_S
+from rh_oft.interface import LevelMap, OftInterface, ddb_to_rh, rh_to_ddb
 
 
 class Harness:
@@ -36,6 +36,20 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(ddb_to_rh(9999), 255)
         for ddb in (-920, -770, -600, -200):
             self.assertLessEqual(abs(rh_to_ddb(ddb_to_rh(ddb)) - ddb), 4)
+
+
+    def test_level_map_follows_the_node_unit(self):
+        db = LevelMap.from_info({"unit": "dB", "scale": 0.1})
+        self.assertEqual(db.to_rh(-600), ddb_to_rh(-600))
+        self.assertEqual(db.from_rh(75), -600)
+        self.assertEqual(LevelMap.from_info(None), db, "a Node with no level reports tenths of a dB")
+        mv = LevelMap.from_info({"unit": "mV", "scale": 1})
+        self.assertEqual(mv.to_rh(850), 131)  # 850 mV / 6.5
+        self.assertEqual(mv.from_rh(131), 852)
+        self.assertEqual(mv.to_rh(5000), 255)
+        other = LevelMap.from_info({"unit": "counts", "scale": 1})
+        self.assertFalse(other.known)
+        self.assertEqual(other.from_rh(other.to_rh(90)), 90)
 
 
 class InterfaceTest(unittest.TestCase):
@@ -109,10 +123,13 @@ class InterfaceTest(unittest.TestCase):
         self.h.run(1)
         self.assertTrue(self.h.fake.puts, "no config PUT")
         cfg = self.h.fake.puts[-1]
-        self.assertEqual(cfg["seats"][0], {"seat": 0, "freq_mhz": 5740, "enabled": True})
-        self.assertEqual(cfg["threshold"]["mode"], "manual")
-        self.assertLessEqual(abs(cfg["threshold"]["enter"] - (-760)), 4)
-        self.assertLessEqual(abs(cfg["threshold"]["exit"] - (-800)), 4)
+        seat = cfg["seats"][0]
+        self.assertEqual((seat["seat"], seat["freq_mhz"], seat["enabled"]), (0, 5740, True))
+        self.assertEqual(seat["threshold"]["mode"], "manual")
+        self.assertLessEqual(abs(seat["threshold"]["enter"] - (-760)), 4)
+        self.assertLessEqual(abs(seat["threshold"]["exit"] - (-800)), 4)
+        self.assertEqual(cfg["threshold"]["mode"], "auto", "the Timer's default threshold is left alone")
+        self.assertEqual(cfg["min_lap_ms"], 2000, "settings the plugin does not own are kept")
         # Disabling the seat is pushed too.
         self.h.iface.set_frequency(0, 0)
         self.h.run(1)
@@ -169,6 +186,80 @@ class InterfaceTest(unittest.TestCase):
         ])
 
 
+    def test_each_seat_gets_its_own_thresholds(self):
+        self.h.close()
+        self.h = Harness(seats=2)
+        self.h.run(2)
+        self.h.iface.set_frequency(0, 5658)
+        self.h.iface.set_frequency(1, 5732)
+        self.h.iface.set_enter_at_level(1, 80)
+        self.h.iface.set_exit_at_level(1, 70)
+        self.h.run(1)
+        seats = self.h.fake.puts[-1]["seats"]
+        self.assertNotIn("threshold", seats[0], "RotorHazard has not set seat 0: it keeps the Timer default")
+        self.assertEqual(seats[1]["threshold"], {"mode": "manual", "enter": rh_to_ddb(80), "exit": rh_to_ddb(70)})
+
+    def test_timer_without_seat_thresholds_gets_one_threshold(self):
+        self.h.fake.seat_thresholds = False
+        self.h.run(2)
+        self.h.iface.set_frequency(0, 5740)
+        self.h.iface.set_enter_at_level(0, 80)
+        self.h.iface.set_exit_at_level(0, 70)
+        self.h.run(1)
+        cfg = self.h.fake.puts[-1]
+        self.assertNotIn("threshold", cfg["seats"][0], "must not send seat thresholds unless announced")
+        self.assertEqual(cfg["threshold"], {"mode": "manual", "enter": rh_to_ddb(80), "exit": rh_to_ddb(70)})
+
+    def test_seat_numbers_ignore_rotorhazards_node_numbering(self):
+        # RotorHazard renumbers node.index across all interfaces: with 8 nodes of its own,
+        # ours becomes node 8, but it is still seat 0 on the Timer.
+        self.h.run(2)
+        self.h.iface.nodes[0].index = 8
+        self.h.iface.set_frequency(0, 5740)
+        self.h.iface.set_enter_at_level(0, 80)
+        self.h.run(1)
+        self.assertEqual(self.h.fake.puts[-1]["seats"][0]["seat"], 0)
+        self.h.fake.add_crossing(monotonic() - 0.2, seat=0)
+        self.h.run(1)
+        self.assertEqual([lap[0] for lap in self.h.laps], [8])
+
+    def test_millivolt_node_levels(self):
+        # An RX5808 Node reports millivolts (spec v0.8), not tenths of a dB.
+        self.h.fake.nodes = [{"id": "f1f1", "chip": "stm32f1", "level": {"unit": "mV", "scale": 1}}]
+        self.h.fake.status_seats[0].update(node="f1f1", rssi=390, floor=380, enter=850, exit=810)
+        self.h.run(2)
+        node = self.h.iface.nodes[0]
+        self.assertEqual(node.current_rssi, 60)  # 390 mV / 6.5
+        self.h.iface.set_frequency(0, 5800)
+        self.h.iface.set_enter_at_level(0, 131)
+        self.h.iface.set_exit_at_level(0, 125)
+        self.h.fake.add_crossing(monotonic() - 0.2, peak=900)
+        self.h.run(1)
+        self.assertEqual(self.h.fake.puts[-1]["seats"][0]["threshold"], {"mode": "manual", "enter": 852, "exit": 812})
+        self.assertEqual(self.h.laps[0][3], 138)  # 900 mV / 6.5
+
+    def test_node_that_joins_later_gets_its_thresholds_resent_in_its_unit(self):
+        # The Timer is up before its Node: no Nodes in /info, so levels default to dB.
+        self.h.fake.nodes = []
+        self.h.fake.status_seats[0]["node"] = None
+        self.h.run(2)
+        self.h.iface.set_frequency(0, 5800)
+        self.h.iface.set_enter_at_level(0, 131)
+        self.h.iface.set_exit_at_level(0, 125)
+        self.h.run(1)
+        self.assertEqual(self.h.fake.puts[-1]["seats"][0]["threshold"]["enter"], rh_to_ddb(131))
+        self.h.fake.nodes = [{"id": "f1f1", "level": {"unit": "mV", "scale": 1}}]
+        self.h.fake.status_seats[0].update(node="f1f1", rssi=390)
+        self.h.run(2)
+        self.assertEqual(self.h.fake.puts[-1]["seats"][0]["threshold"], {"mode": "manual", "enter": 852, "exit": 812})
+        self.assertEqual(self.h.iface.nodes[0].current_rssi, 60)
+
+    def test_methods_rotorhazard_calls_on_every_interface(self):
+        self.h.iface.close_fwupd_serial_port()
+        self.h.iface.set_intf_error_report_percent_limit(1.0)
+        self.assertEqual(self.h.iface.get_intf_total_error_count(), 0)
+
+
 class PluginInitTest(unittest.TestCase):
     def test_initialize_adds_interface_and_reads_options(self):
         import rh_oft
@@ -202,6 +293,18 @@ class PluginInitTest(unittest.TestCase):
         iface = Api.interface.added[0]
         self.assertEqual(iface.url, "http://10.0.0.9:7270")
         self.assertEqual(len(iface.nodes), 2)
+
+    def test_seat_count_comes_from_the_timer(self):
+        import rh_oft
+
+        fake = FakeTimer()
+        fake.config["seats"] = [{"seat": n, "freq_mhz": 5658 + 37 * n, "enabled": n < 2} for n in range(3)]
+        url = fake.start()
+        try:
+            self.assertEqual(rh_oft.timer_seat_count(url), 3, "disabled seats count too")
+        finally:
+            fake.stop()
+        self.assertIsNone(rh_oft.timer_seat_count("http://127.0.0.1:9"), "an unreachable Timer")
 
 
 if __name__ == "__main__":

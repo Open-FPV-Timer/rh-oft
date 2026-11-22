@@ -7,7 +7,7 @@
   "documentation_uri": "https://github.com/open-fpv-timer/rh-oft",
   "license": "GPL-3.0-or-later",
   "license_uri": "https://github.com/open-fpv-timer/rh-oft/blob/main/LICENSE",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "required_rhapi_version": "1.4",
   "zip_filename": "rh_oft.zip"
 }

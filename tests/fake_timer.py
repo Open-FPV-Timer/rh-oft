@@ -22,7 +22,9 @@ class FakeTimer:
             "threshold": {"mode": "auto", "snr_enter": 150, "hysteresis": 50},
             "min_lap_ms": 2000,
         }
-        self.status_seats = [{"seat": 0, "rssi": -915, "floor": -920, "enter": -770, "exit": -820, "crossing": False, "rate_hz": 1000}]
+        self.nodes = [{"id": "c5c5c5c5c5c5", "chip": "esp32c5", "fw": "0.1.0", "max_seats": 8, "level": {"unit": "dB", "scale": 0.1}}]
+        self.seat_thresholds = True
+        self.status_seats = [{"seat": 0, "node": "c5c5c5c5c5c5", "rssi": -915, "floor": -920, "enter": -770, "exit": -820, "crossing": False, "rate_hz": 1000}]
         self.puts = []
         self.requests = []
         self.fail = False  # when True, refuse connections (simulate the gate unplugged)
@@ -81,7 +83,7 @@ class FakeTimer:
                 fake.requests.append(("GET", u.path))
                 with fake.lock:
                     if u.path == "/oft/v1/info":
-                        self._send(200, {"id": "oft-fake", "name": "Fake", "boot_id": fake.boot_id, "proto": 1, "level": "L3", "fw": "0.1.0", "capabilities": {"crossings": {}}})
+                        self._send(200, {"id": "oft-fake", "name": "Fake", "boot_id": fake.boot_id, "proto": 1, "level": "L3", "fw": "0.1.0", "nodes": fake.nodes, "capabilities": {"crossings": {}, "config": {"seat_thresholds": fake.seat_thresholds}}})
                     elif u.path == "/oft/v1/time":
                         self._send(200, {"time_us": fake.timer_us(), "boot_id": fake.boot_id})
                     elif u.path == "/oft/v1/status":

@@ -1,9 +1,12 @@
 PYTHON ?= python3
 
-.PHONY: test zip clean
+.PHONY: test rh-test zip clean
 
 test: ## Run the plugin tests against a fake OFT Timer
 	PYTHONPATH=.:tests:tests/stubs $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+
+rh-test: ## Run the plugin inside RotorHazard in Docker, against `oftd --fake`
+	tests/rh/run.sh
 
 zip: ## Build dist/rh_oft.zip for dropping into ~/rh-data/plugins/
 	rm -rf dist && mkdir -p dist/rh_oft
