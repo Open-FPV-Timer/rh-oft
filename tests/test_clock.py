@@ -43,6 +43,38 @@ class ClockAlignTest(unittest.TestCase):
         err = c.to_local(int((100.0 + offset) * 1e6)) - 100.0
         self.assertLess(abs(err), 0.001, "alignment error %.4f s" % err)
 
+    def test_a_drifting_timer_clock_is_followed(self):
+        # A real Timer's clock ran 70 ppm off the server's: laps 8 s apart must still be right.
+        rnd = random.Random(2)
+        c = ClockAlign()
+        drift = -70e-6
+
+        def timer_us(local):
+            return int((local * (1 + drift) + 500.0) * 1e6)
+
+        worst = 0.0
+        for k in range(120):
+            local = 10.0 + k
+            rtt = rnd.uniform(0.012, 0.016)
+            skew = rnd.uniform(-0.0003, 0.0003)  # the reply is not exactly mid round trip
+            c.add(local - rtt / 2 + skew, local + rtt / 2 + skew, timer_us(local))
+            if k >= 30:
+                lap = c.to_local(timer_us(local - 1.0)) - c.to_local(timer_us(local - 9.0))
+                worst = max(worst, abs(lap - 8.0))
+        self.assertAlmostEqual(c.rate, -drift, delta=20e-6)
+        self.assertLess(worst, 0.0003, "a lap was wrong by %.3f ms" % (worst * 1e3))
+
+    def test_one_lucky_fast_reply_does_not_stop_the_alignment(self):
+        # Seen on a real Wi-Fi Timer: one 2 ms reply among 13 ms ones froze the clock fit.
+        c = ClockAlign()
+        drift = -70e-6
+        for k in range(200):
+            local = 10.0 + k
+            rtt = 0.002 if k == 3 else 0.013
+            c.add(local - rtt / 2, local + rtt / 2, int((local * (1 + drift) + 500.0) * 1e6))
+        now_us = int((209.0 * (1 + drift) + 500.0) * 1e6)
+        self.assertAlmostEqual(c.to_local(now_us), 209.0, delta=0.0002)
+
     def test_boot_id_change_resets(self):
         c = ClockAlign()
         c.add(0.0, 0.002, 1_000_000, boot_id="a")

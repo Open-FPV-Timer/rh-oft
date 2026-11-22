@@ -16,10 +16,16 @@ class OftError(Exception):
     """The Timer could not be reached or answered with an error."""
 
 
+class OftControlled(OftError):
+    """Another client holds control of the Timer, so it refused this write (423, spec §6.6)."""
+
+
 class OftClient:
     def __init__(self, base_url, timeout=0.5):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        #: The key of the claim that holds control, sent with every write (spec §6.6).
+        self.control_key = None
 
     # -- raw -------------------------------------------------------------------------
 
@@ -30,11 +36,20 @@ class OftClient:
         if body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
+        if method != "GET" and self.control_key:
+            headers["OFT-Control"] = self.control_key
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
+            if e.code == 423:
+                try:
+                    why = json.loads(e.read()).get("error")
+                except (ValueError, AttributeError, OSError):
+                    why = None
+                e.close()
+                raise OftControlled(why or "controlled by another client") from e
             raise OftError("%s %s -> HTTP %s" % (method, path, e.code)) from e
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             raise OftError("%s %s -> %s" % (method, path, e)) from e

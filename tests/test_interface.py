@@ -1,8 +1,8 @@
 import unittest
-from time import monotonic
+from time import monotonic, sleep
 
 from fake_timer import FakeTimer
-from rh_oft.interface import LevelMap, OftInterface, ddb_to_rh, rh_to_ddb
+from rh_oft.interface import LevelMap, OftInterface, claim_name, ddb_to_rh, rh_to_ddb
 
 
 class Harness:
@@ -254,57 +254,202 @@ class InterfaceTest(unittest.TestCase):
         self.assertEqual(self.h.fake.puts[-1]["seats"][0]["threshold"], {"mode": "manual", "enter": 852, "exit": 812})
         self.assertEqual(self.h.iface.nodes[0].current_rssi, 60)
 
+    def test_another_timer_at_the_address_is_refused(self):
+        # The address we remembered now belongs to a different Timer (DHCP gave it away).
+        self.h.iface.timer_id = "oft-mine"
+        self.h.iface.nodes[0].frequency = 5800
+        self.h.fake.add_crossing(monotonic() - 0.2)
+        self.h.run(2)
+        self.assertFalse(self.h.iface.connected)
+        self.assertIn("oft-fake, not oft-mine", self.h.iface.ready_failure_msg)
+        self.assertEqual(self.h.laps, [], "another Timer's laps are not ours")
+
+    def test_timer_is_found_again_by_id_at_a_new_address(self):
+        self.h.run(2)
+        self.assertEqual(self.h.iface.timer_id, "oft-fake", "the id is learned on first contact")
+        old_url = self.h.iface.url
+        # The Timer comes back on another address: same id, new port here.
+        self.h.fake.stop()
+        moved_to = FakeTimer()
+        new_url = moved_to.start()
+        asked, told = [], []
+        self.h.iface.locate = lambda timer_id: asked.append(timer_id) or new_url
+        self.h.iface.on_moved = lambda timer_id, url: told.append((timer_id, url))
+        try:
+            self.h.run(1)
+            self.assertEqual(asked, ["oft-fake"])
+            self.assertEqual(told, [("oft-fake", new_url)])
+            self.assertNotEqual(self.h.iface.url, old_url)
+            self.h.iface.nodes[0].frequency = 5800
+            self.h.run(2)
+            self.assertTrue(self.h.iface.connected)
+            moved_to.add_crossing(monotonic() - 0.2)
+            self.h.run(1)
+            self.assertEqual(len(self.h.laps), 1)
+        finally:
+            moved_to.stop()
+
+    def test_looking_a_lost_timer_up_is_rate_limited(self):
+        self.h.run(2)
+        asked = []
+        self.h.iface.locate = lambda timer_id: asked.append(timer_id)
+        self.h.fake.fail = True
+        self.h.run(5)
+        self.assertEqual(len(asked), 1)
+
     def test_methods_rotorhazard_calls_on_every_interface(self):
         self.h.iface.close_fwupd_serial_port()
         self.h.iface.set_intf_error_report_percent_limit(1.0)
         self.assertEqual(self.h.iface.get_intf_total_error_count(), 0)
 
 
-class PluginInitTest(unittest.TestCase):
-    def test_initialize_adds_interface_and_reads_options(self):
-        import rh_oft
+class ControlTest(unittest.TestCase):
+    """Spec 6.6: one client at a time may change a Timer."""
 
-        class Db:
-            def option(self, name, default=None):
-                return {"rh_oft_url": "http://10.0.0.9:7270", "rh_oft_seats": "2"}.get(name, default)
+    def setUp(self):
+        self.h = Harness()
+        self.h.fake.control = True
+        self.told = []
+        self.h.iface.on_control = lambda iface, name: self.told.append(name)
 
-        class Ifaces:
-            added = []
+    def tearDown(self):
+        self.h.iface.stop()
+        self.h.close()
 
-            def add(self, iface):
-                self.added.append(iface)
+    def until(self, done, what, seconds=3.0):
+        """Poll like RotorHazard would until ``done()``; the stream answers from another thread."""
+        end = monotonic() + seconds
+        while monotonic() < end:
+            self.h.iface._next_write = 0.0
+            self.h.run(1)
+            if done():
+                return
+            sleep(0.01)
+        self.fail("never happened: " + what)
 
-        class UI:
-            def register_panel(self, *a, **k):
+    def tune(self, freq):
+        self.h.iface.set_frequency(0, freq)
+
+    def written(self):
+        return [put["seats"][0]["freq_mhz"] for put in self.h.fake.puts]
+
+    def test_claims_on_its_stream_and_writes_with_the_key(self):
+        self.until(lambda: self.h.iface.client.control_key, "RotorHazard holds control")
+        self.assertEqual(self.h.fake.stream_messages, [{"type": "control", "claim": claim_name()}])
+        self.assertEqual(self.h.iface.client.control_key, self.h.fake.key)
+        self.tune(5732)
+        self.until(lambda: 5732 in self.written(), "the frequency is written")
+        self.assertEqual(self.h.fake.refused, [])
+        self.assertIsNone(self.h.iface.controlled_by)
+
+    def test_a_timer_without_control_gets_no_stream(self):
+        self.h.fake.control = False
+        self.tune(5732)
+        self.h.run(3)
+        self.assertIsNone(self.h.iface.stream)
+        self.assertEqual(self.written()[-1], 5732)
+
+    def test_waits_while_another_client_holds_control_then_sends_everything(self):
+        page = self.h.fake.add_claim("Timer page")
+        self.tune(5732)
+        self.until(lambda: self.h.iface._control_state == "other", "RotorHazard sees it must wait")
+        self.h.run(5)
+        self.assertEqual(self.h.fake.puts, [], "nothing may be written while another client holds control")
+        self.assertEqual(self.h.iface.controlled_by, "Timer page")
+        self.assertEqual(self.told, ["Timer page"])
+        self.assertFalse(any("takeover" in m for m in self.h.fake.stream_messages))
+        # The page changes the Timer, then closes: control passes to RotorHazard's claim.
+        self.h.fake.config["seats"][0]["freq_mhz"] = 5917
+        self.h.fake.end_claim(page)
+        self.until(lambda: self.h.fake.config["seats"][0]["freq_mhz"] == 5732, "RotorHazard's settings are sent when control comes")
+        self.assertEqual(self.told, ["Timer page", None])
+        self.assertIsNone(self.h.iface.controlled_by)
+
+    def test_control_taken_away_and_given_back(self):
+        self.tune(5732)
+        self.until(lambda: 5732 in self.written(), "the frequency is written")
+        page = self.h.fake.add_claim("Timer page")
+        self.h.fake.grant(page)  # a person picks the page as the writer, on the Timer's page
+        self.until(lambda: self.h.iface.controlled_by == "Timer page", "RotorHazard sees it lost control")
+        self.assertIsNone(self.h.iface.client.control_key)
+        self.tune(5769)
+        self.h.run(5)
+        self.assertNotIn(5769, self.written())
+        self.h.fake.config["seats"][0]["freq_mhz"] = 5917  # the page's own change
+        self.h.fake.grant(self.h.fake.claim_named(claim_name()))
+        self.until(lambda: self.h.fake.config["seats"][0]["freq_mhz"] == 5769, "the pending frequency is sent")
+        self.assertEqual(self.h.fake.refused, [])
+        self.h.fake.end_claim(page)
+
+    def test_writes_without_a_key_when_nobody_holds_control(self):
+        self.until(lambda: self.h.iface.client.control_key, "RotorHazard holds control")
+        self.h.fake.grant(None)
+        self.until(lambda: self.h.iface._control_state == "free", "RotorHazard sees nobody holds control")
+        self.assertIsNone(self.h.iface.client.control_key)
+        self.tune(5806)
+        self.until(lambda: 5806 in self.written(), "the frequency is written")
+
+    def test_claims_again_when_the_stream_drops(self):
+        self.until(lambda: self.h.iface.client.control_key, "RotorHazard holds control")
+        first = self.h.fake.key
+        self.h.fake.drop_streams()
+        self.h.iface._next_stream = 0.0
+        self.until(lambda: self.h.iface.stream is None, "the drop is noticed")
+        self.h.iface._next_stream = 0.0
+        self.until(lambda: self.h.iface.client.control_key not in (None, first), "RotorHazard holds control again")
+        self.assertEqual([m["claim"] for m in self.h.fake.stream_messages], [claim_name()] * 2, "one claim per stream")
+        self.tune(5843)
+        self.until(lambda: 5843 in self.written(), "the frequency is written with the new key")
+
+    def test_a_short_drop_keeps_control_by_showing_the_key_again(self):
+        self.h.fake.grace = True
+        self.until(lambda: self.h.iface.client.control_key, "RotorHazard holds control")
+        key, claim = self.h.fake.key, self.h.fake.holder
+        self.h.fake.add_claim("Timer page")  # waiting: it would get control if ours ended
+        self.h.fake.drop_streams()
+        self.h.iface._next_stream = 1e12  # stay away for now
+        self.until(lambda: self.h.iface.stream is None, "the drop is noticed")
+        self.tune(5880)
+        self.until(lambda: 5880 in self.written(), "the key still works for writes while away")
+        self.h.iface._next_stream = 0.0
+        self.until(lambda: self.h.iface._control_state == "hold", "RotorHazard is back on a new stream")
+        self.assertEqual(self.h.fake.stream_messages[-1], {"type": "control", "claim": claim_name(), "key": key})
+        self.assertEqual((self.h.fake.key, self.h.fake.holder), (key, claim), "the same claim, still holding control")
+        self.assertEqual(self.told, [])
+        self.assertEqual(self.h.fake.refused, [])
+
+    def test_claim_name_fits_the_spec(self):
+        self.assertEqual(claim_name("pit-box"), "RotorHazard pit-box")
+        self.assertEqual(claim_name('a"b\\c\u00e9'), "RotorHazard abc")
+        self.assertEqual(len(claim_name("x" * 60)), 32)
+
+    def test_a_refused_write_means_wait_when_there_is_no_stream(self):
+        import rh_oft.interface as module
+
+        class NoStream:
+            def __init__(self, *a, **k):
                 pass
 
-        class Fields:
-            def register_option(self, *a, **k):
-                pass
+            def connect(self):
+                raise module.StreamError("no stream here")
 
-        class Api:
-            db = Db()
-            interface = Ifaces()
-            ui = UI()
-            fields = Fields()
-
-        rh_oft.initialize(Api())
-        self.assertEqual(len(Api.interface.added), 1)
-        iface = Api.interface.added[0]
-        self.assertEqual(iface.url, "http://10.0.0.9:7270")
-        self.assertEqual(len(iface.nodes), 2)
-
-    def test_seat_count_comes_from_the_timer(self):
-        import rh_oft
-
-        fake = FakeTimer()
-        fake.config["seats"] = [{"seat": n, "freq_mhz": 5658 + 37 * n, "enabled": n < 2} for n in range(3)]
-        url = fake.start()
+        real, module.ControlStream = module.ControlStream, NoStream
         try:
-            self.assertEqual(rh_oft.timer_seat_count(url), 3, "disabled seats count too")
+            page = self.h.fake.add_claim("Timer page")
+            self.tune(5732)
+            self.h.run(3)
+            self.assertEqual(self.h.fake.puts, [])
+            self.assertGreaterEqual(len(self.h.fake.refused), 1)
+            self.assertEqual(self.h.iface.controlled_by, "Timer page")
+            self.assertTrue(self.h.iface.connected, "a refused write is not a lost Timer")
+            refused = len(self.h.fake.refused)
+            self.h.run(5)
+            self.assertEqual(len(self.h.fake.refused), refused, "refused writes are not repeated every poll")
+            self.h.fake.end_claim(page)
+            self.until(lambda: 5732 in self.written(), "the frequency is written once the Timer is free")
+            self.assertIsNone(self.h.iface.controlled_by)
         finally:
-            fake.stop()
-        self.assertIsNone(rh_oft.timer_seat_count("http://127.0.0.1:9"), "an unreachable Timer")
+            module.ControlStream = real
 
 
 if __name__ == "__main__":
